@@ -1,0 +1,330 @@
+// === Config ===
+let LAT = 52.3676;      // fallback latitude (Amsterdam)
+let LON = 4.9041;       // fallback longitude
+let TWILIGHT_MIN = 45;  // minutes for twilight before sunrise / after sunset
+let MIN_BRIGHT = 10;    // %
+let MAX_BRIGHT = 100;   // %
+
+let PREDAWN_BRIGHT = 4;   // %
+let PULSE_BRIGHT   = 10;  // %
+let PULSE_MS       = 100; // ms 'energize' pulse
+
+let CYCLE_WINDOW_MS = 30 * 1000;  // 30s re-toggle window
+let UPDATE_MS = 30 * 1000;        // how often to re-apply scaled brightness when ON
+
+// === KVS keys ===
+let KEY_IDX    = "brightness_idx";
+let KEY_WSTART = "brightness_window_start_ms";
+let KEY_SIG    = "brightness_sig"; // "DAY" or "NIGHT"
+
+// === State ===
+let idx = 0;
+let windowStartMs = 0;
+let lastSig = "";            // "DAY" | "NIGHT"
+let sunriseMs = 0;           // today's sunrise (epoch ms)
+let sunsetMs  = 0;           // today's sunset (epoch ms)
+let dayKey = "";             // "YYYY-MM-DD" of the fetched times
+let lastOnIndex = -1;        // which entry (0/1/2) was used when turning ON, -1 if OFF
+
+// === Helpers ===
+function log(msg){ print("[CycleScript] " + msg); }
+function pad2(n){ return (n<10?"0":"")+n; }
+function ymdKey(d){ return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate()); }
+
+function currentMode(nowMs){
+  if (sunriseMs===0 || sunsetMs===0) return "DAY"; // default until fetched
+  return (nowMs >= sunriseMs && nowMs < sunsetMs) ? "DAY" : "NIGHT";
+}
+
+function midnightMs(now){
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+}
+function preDawnStartMs(){ return sunriseMs - TWILIGHT_MIN * 60000; }
+function isPreDawnDeepNight(nowMs){
+  if (sunriseMs === 0) return false; // totdat we tijden hebben
+  let now = new Date(nowMs);
+  let mid = midnightMs(now);
+  return (nowMs >= mid && nowMs < preDawnStartMs());
+}
+
+// === KVS write serializer (no shift/push) ===
+let kvsBatch = [];   // array of {key,value}
+let kvsPtr = 0;      // current index being processed
+let kvsInFlight = false;
+
+function enqueueKVS(key, value){
+  // de-dup: update existing pending entry if present
+  let i;
+  for (i = kvsPtr; i < kvsBatch.length; i++){
+    if (kvsBatch[i].key === key){
+      kvsBatch[i].value = value;
+      key = null; // mark as merged
+      break;
+    }
+  }
+  if (key !== null){
+    // append without using push()
+    kvsBatch[kvsBatch.length] = { key: key, value: value };
+  }
+  processKVSQueue();
+}
+
+function processKVSQueue(){
+  if (kvsInFlight) return;
+  if (kvsPtr >= kvsBatch.length){
+    // drained
+    kvsBatch = [];
+    kvsPtr = 0;
+    return;
+  }
+  kvsInFlight = true;
+  let item = kvsBatch[kvsPtr];
+  Shelly.call("KVS.Set", { key: item.key, value: item.value }, function(){
+    kvsInFlight = false;
+    kvsPtr++;
+    processKVSQueue();
+  });
+}
+
+// === Location ===
+function loadLatLon(cb){
+  Shelly.call("Sys.GetConfig", {}, function(res, ec){
+    if (!ec && res && res.location) {
+      if (typeof res.location.lat === "number") LAT = res.location.lat;
+      if (typeof res.location.lon === "number") LON = res.location.lon;
+      log("Using lat="+LAT+" lon="+LON);
+    } else {
+      log("Using fallback lat/lon="+LAT+"/"+LON);
+    }
+    if (cb) cb();
+  });
+}
+
+// === Sunrise/Sunset fetch from API ===
+function refreshSunTimes(){
+  let now = new Date();
+  let today = ymdKey(now);
+  let url = "https://api.sunrise-sunset.org/json?lat="+LAT+"&lng="+LON+"&date=today&formatted=0";
+
+  Shelly.call("HTTP.Request", { method:"GET", url:url, timeout:10 }, function(r, ec, em){
+    if (ec || !r || r.code !== 200) {
+      log("Sun API error; fallback times used");
+      fallbackTimes(now, today);
+      return;
+    }
+    try {
+      let obj = JSON.parse(r.body);
+      if (!obj || !obj.results || !obj.results.sunrise || !obj.results.sunset)
+        throw new Error("Missing sunrise/sunset");
+
+      let srUTC = new Date(obj.results.sunrise);
+      let ssUTC = new Date(obj.results.sunset);
+      if (isNaN(srUTC.getTime()) || isNaN(ssUTC.getTime()))
+        throw new Error("Invalid date");
+
+      sunriseMs = srUTC.getTime();
+      sunsetMs  = ssUTC.getTime();
+      dayKey = today;
+
+      log("Fetched sunrise UTC " + pad2(srUTC.getHours()) + ":" + pad2(srUTC.getMinutes())
+        + " / sunset UTC " + pad2(ssUTC.getHours()) + ":" + pad2(ssUTC.getMinutes()));
+    } catch(e) {
+      log("Parse error: " + e + " ; using fallback times");
+      fallbackTimes(now, today);
+    }
+  });
+}
+
+function fallbackTimes(now, today){
+  let sr = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 7, 0, 0, 0);
+  let ss = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 20, 0, 0, 0);
+  sunriseMs = sr.getTime();
+  sunsetMs  = ss.getTime();
+  dayKey = today;
+}
+
+function ensureFreshSunData(){
+  let now = new Date();
+  let todayKey = ymdKey(now);
+  if (sunriseMs===0 || sunsetMs===0 || dayKey!==todayKey || now.getTime() > sunsetMs) {
+    refreshSunTimes();
+  }
+}
+
+// === Exponential scalers ===
+function scaledAfterSunset(nowMs){
+  let dtMin = (nowMs - sunsetMs) / 60000;
+  if (dtMin <= 0) return MAX_BRIGHT;
+  if (dtMin >= TWILIGHT_MIN) return MIN_BRIGHT;
+  let k = Math.log(MIN_BRIGHT / MAX_BRIGHT) / TWILIGHT_MIN;
+  return Math.round(MAX_BRIGHT * Math.exp(k * dtMin));
+}
+
+function scaledBeforeSunrise(nowMs){
+  let dtToSrMin = (sunriseMs - nowMs) / 60000;
+  if (dtToSrMin <= 0) return MAX_BRIGHT;
+  if (dtToSrMin >= TWILIGHT_MIN) return MIN_BRIGHT;
+  let k = Math.log(MIN_BRIGHT / MAX_BRIGHT) / TWILIGHT_MIN;
+  return Math.round(MAX_BRIGHT * Math.exp(k * dtToSrMin));
+}
+
+// === Build current array ===
+function getLevels(){
+  ensureFreshSunData();
+  let nowMs = (new Date()).getTime();
+
+  // Day
+  if (nowMs >= sunriseMs && nowMs < sunsetMs) {
+    return [100, 50];
+  }
+
+  // Pre-dawn twilight
+  if (nowMs >= sunriseMs - TWILIGHT_MIN*60000 && nowMs < sunriseMs) {
+    return [scaledBeforeSunrise(nowMs), 50, 100];
+  }
+
+  // After sunset twilight
+  if (nowMs >= sunsetMs && nowMs < sunsetMs + TWILIGHT_MIN*60000) {
+    return [scaledAfterSunset(nowMs), 50, 100];
+  }
+
+  // After midnight till dawn
+  if (isPreDawnDeepNight(nowMs)) {
+    return [PREDAWN_BRIGHT, 50, 100];
+  }
+
+  // Deep night (rest van de nacht, bv. na avondschemering tot 00:00): behoud MIN_BRIGHT
+  return [MIN_BRIGHT, 50, 100];
+}
+
+// === KVS (load only; saves go through the serializer) ===
+function loadKVS(){
+  Shelly.call("KVS.Get", { key: KEY_IDX }, function(res, ec){
+    if (!ec && res && typeof res.value!=="undefined") {
+      let n = Number(res.value); if (!isNaN(n)) idx = n;
+    }
+    Shelly.call("KVS.Get", { key: KEY_WSTART }, function(res2, ec2){
+      if (!ec2 && res2 && typeof res2.value!=="undefined") {
+        let t = Number(res2.value); if (!isNaN(t)) windowStartMs = t;
+      }
+      Shelly.call("KVS.Get", { key: KEY_SIG }, function(res3, ec3){
+        if (!ec3 && res3 && typeof res3.value!=="undefined") lastSig = String(res3.value);
+        log("Boot: idx="+idx+" windowStartMs="+windowStartMs+" lastSig="+lastSig);
+      });
+    });
+  });
+}
+function saveIdx(){ enqueueKVS(KEY_IDX, idx); }
+function saveWindow(nowMs, sig){
+  windowStartMs = nowMs; lastSig = sig;
+  enqueueKVS(KEY_WSTART, windowStartMs);
+  enqueueKVS(KEY_SIG, lastSig);
+}
+
+// === Light ===
+function turnOnAt(level){
+  log("ON at "+level+"%");
+  Shelly.call("Light.Set", { id:0, on:true, brightness:level, transition:0 }, function(){});
+}
+
+// Only in het pre-dawn window: first a PULSE_BRIGHT, then move to very low light mode
+function turnOnPossiblyWithPulse(targetLevel, nowMs){
+  if (isPreDawnDeepNight(nowMs) && targetLevel === PREDAWN_BRIGHT){
+    log("Pre-dawn pulse: " + PULSE_BRIGHT + "% → " + targetLevel + "% after " + PULSE_MS + "ms");
+    Shelly.call("Light.Set", { id:0, on:true, brightness:PULSE_BRIGHT, transition:0 }, function(){
+      Timer.set(PULSE_MS, false, function(){
+        Shelly.call("Light.Set", { id:0, on:true, brightness:targetLevel, transition:0 }, function(){});
+      });
+    });
+  } else {
+    turnOnAt(targetLevel);
+  }
+}
+function turnOffInstant(){
+  log("OFF instantly");
+  Shelly.call("Light.Set", { id:0, on:false, brightness:0, transition:0 }, function(){});
+}
+
+// === Cycle logic ===
+function clampIdx(levels){ idx = idx % levels.length; if (idx<0) idx=0; }
+function shouldResetWindow(nowMs, modeSig){
+  let inWindow = (nowMs - windowStartMs) <= CYCLE_WINDOW_MS;
+  let same = (modeSig === lastSig);
+  return !(inWindow && same);
+}
+
+// === Event handler ===
+Shelly.addEventHandler(function(e){
+  if (e.component==="input:0" && e.info && e.info.event==="toggle"){
+    let levels = getLevels();
+    let nowMs = (new Date()).getTime();
+    let modeSig = currentMode(nowMs); // "DAY" or "NIGHT"
+
+    if (e.info.state){
+      // ON
+      if (shouldResetWindow(nowMs, modeSig)){
+        idx = 0;
+        saveWindow(nowMs, modeSig);
+        // we persist idx only once after advancing (below)
+      }
+      clampIdx(levels);
+      lastOnIndex = idx;
+      turnOnPossiblyWithPulse(levels[idx], nowMs);
+
+      // Prepare next index for quick re-toggle within 30s, then persist ONCE
+      idx = (idx + 1) % levels.length;
+      saveIdx();
+
+    } else {
+      // OFF
+      turnOffInstant();
+      lastOnIndex = -1;
+      // no KVS writes here
+    }
+  }
+});
+
+// === Periodic updater: keep first (scaled) value adapting while ON at NIGHT ===
+Timer.set(UPDATE_MS, true, function(){
+  ensureFreshSunData();
+  let nowMs = (new Date()).getTime();
+  if (currentMode(nowMs) !== "NIGHT") return;
+  if (lastOnIndex !== 0) return;
+
+  Shelly.call("Light.GetStatus", { id:0 }, function(res, ec){
+    if (ec || !res || !res.ison) return;
+
+    // Recompute dynamic target (handles both after-sunset and pre-sunrise)
+    let target;
+    if (nowMs < sunriseMs) target = scaledBeforeSunrise(nowMs);
+    else if (nowMs >= sunsetMs) target = scaledAfterSunset(nowMs);
+    else return; // daytime, nothing to do
+
+    let current = (typeof res.brightness === "number") ? Math.round(res.brightness) : null;
+    if (current === null || Math.abs(target - current) >= 1) {
+      log("Adjusting scaled brightness to " + target + "%");
+      Shelly.call("Light.Set", { id:0, on:true, brightness:target, transition:0 }, function(){});
+    }
+  });
+});
+
+// === Daily self-scheduling refresh at 00:10 (Cron-free) ===
+function msUntilNext(h, m, s){
+  let now = new Date();
+  let next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, s||0, 0);
+  if (next.getTime() <= now.getTime()) next = new Date(now.getFullYear(), now.getMonth(), now.getDate()+1, h, m, s||0, 0);
+  return next.getTime() - now.getTime();
+}
+function scheduleDailyRefresh(){
+  let delay = msUntilNext(0,10,0);
+  if (delay < 1000) delay = 1000;
+  Timer.set(delay, false, function(){
+    refreshSunTimes();
+    scheduleDailyRefresh();
+  });
+}
+
+// === Boot ===
+loadKVS();
+loadLatLon(function(){ refreshSunTimes(); });
+scheduleDailyRefresh();

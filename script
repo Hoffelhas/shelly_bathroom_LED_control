@@ -12,6 +12,10 @@ let PULSE_MS       = 100; // ms 'energize' pulse
 let CYCLE_WINDOW_MS = 30 * 1000;  // 30s re-toggle window
 let UPDATE_MS = 30 * 1000;        // how often to re-apply scaled brightness when ON
 
+// === NEW: configurable start of "deep night" (was hardcoded to midnight)
+let DEEP_NIGHT_START_H = 0;  // 0..23  (default = 00:00 keeps old behavior)
+let DEEP_NIGHT_START_M = 0;  // 0..59
+
 // === KVS keys ===
 let KEY_IDX    = "brightness_idx";
 let KEY_WSTART = "brightness_window_start_ms";
@@ -36,15 +40,25 @@ function currentMode(nowMs){
   return (nowMs >= sunriseMs && nowMs < sunsetMs) ? "DAY" : "NIGHT";
 }
 
-function midnightMs(now){
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+// Replaces midnightMs(): returns ms for the configured deep-night start
+function deepNightStartMs(now){
+  return new Date(
+    now.getFullYear(), now.getMonth(), now.getDate(),
+    DEEP_NIGHT_START_H, DEEP_NIGHT_START_M, 0, 0
+  ).getTime();
 }
+
 function preDawnStartMs(){ return sunriseMs - TWILIGHT_MIN * 60000; }
+
+// Deep night is from the configured start time up to the start of pre-dawn
+// If we're after midnight but before today's deep-night start time,
+// the window started yesterday at the configured time.
 function isPreDawnDeepNight(nowMs){
-  if (sunriseMs === 0) return false; // totdat we tijden hebben
+  if (sunriseMs === 0) return false; // until we have times
   let now = new Date(nowMs);
-  let mid = midnightMs(now);
-  return (nowMs >= mid && nowMs < preDawnStartMs());
+  let start = deepNightStartMs(now);
+  if (nowMs < start) start -= 24*60*60*1000; // use previous day's start
+  return (nowMs >= start && nowMs < preDawnStartMs());
 }
 
 // === KVS write serializer (no shift/push) ===
@@ -188,12 +202,12 @@ function getLevels(){
     return [scaledAfterSunset(nowMs), 50, 100];
   }
 
-  // After midnight till dawn
+  // From configured deep-night start until pre-dawn window
   if (isPreDawnDeepNight(nowMs)) {
     return [PREDAWN_BRIGHT, 50, 100];
   }
 
-  // Deep night (rest van de nacht, bv. na avondschemering tot 00:00): behoud MIN_BRIGHT
+  // The rest of the night (e.g., after evening twilight until deep-night start): keep MIN_BRIGHT
   return [MIN_BRIGHT, 50, 100];
 }
 
@@ -227,7 +241,7 @@ function turnOnAt(level){
   Shelly.call("Light.Set", { id:0, on:true, brightness:level, transition:0 }, function(){});
 }
 
-// Only in het pre-dawn window: first a PULSE_BRIGHT, then move to very low light mode
+// Only in the pre-dawn window: first a PULSE_BRIGHT, then move to very low light mode
 function turnOnPossiblyWithPulse(targetLevel, nowMs){
   if (isPreDawnDeepNight(nowMs) && targetLevel === PREDAWN_BRIGHT){
     log("Pre-dawn pulse: " + PULSE_BRIGHT + "% → " + targetLevel + "% after " + PULSE_MS + "ms");
